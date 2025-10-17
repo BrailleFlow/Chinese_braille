@@ -6,6 +6,7 @@ We recommend using a conda environment to manage dependencies.
 conda create -n braille_env python=3.10
 conda activate braille_env
 pip install -r requirements.txt
+```bash
 The installation of `pytorch` may vary depending on your system.  
 Please refer to the [official website](https://pytorch.org) for more information.
 
