@@ -17,21 +17,20 @@
 Fine-tuning the library models for sequence to sequence.
 """
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
-import sys, os
-if os.getcwd() in sys.path:
-    sys.path.remove(os.getcwd())
-import json
+
 import logging
 import os
 import sys
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
 import datasets
 import evaluate
 import numpy as np
-import transformers
 from datasets import load_dataset
+
+import transformers
 from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
@@ -49,8 +48,9 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
-
+from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.42.0.dev0")
@@ -60,187 +60,7 @@ require_version(
     "To fix: pip install -r examples/pytorch/translation/requirements.txt",
 )
 
-
-# === BBG/MBE imports ===
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import types
-from transformers.modeling_outputs import Seq2SeqLMOutput
-
 logger = logging.getLogger(__name__)
-
-# === Inject BBG (Boundary Gate) + MBE (Mixture-of-Braille-Experts) into model ===
-def patch_bbg_mbe(model, tokenizer,
-                  n_experts: int = 4,
-                  router_tau: float = 1.0,
-                  router_topk: int = 0,
-                  alpha: float = 1.0,
-                  beta: float = 1.0,
-                  lambda_bg: float = 0.5,
-                  lambda_ent: float = 0.0):
-    """Modify the loaded Seq2Seq model *in-place*:
-    - Attach BBG and MBE submodules as children of `model`
-    - Monkey-patch `model.forward` so both training *and* generation use the modified logits.
-    """
-    # Collect Braille token ids and sp id
-    vocab = tokenizer.get_vocab()
-    braille_ids = sorted({tid for tok, tid in vocab.items() if (len(tok) == 1 and '\u2800' <= tok <= '\u28FF')})
-    assert len(braille_ids) > 0, "No Braille tokens found in tokenizer. Please add them first."
-
-    sp_id = tokenizer.convert_tokens_to_ids("sp")
-    if sp_id == tokenizer.unk_token_id:
-        sp_id = tokenizer.convert_tokens_to_ids("▁sp")
-    assert sp_id != tokenizer.unk_token_id, "Cannot find token id for 'sp' (or '▁sp')."
-    d_model = model.config.d_model
-
-    # Attach submodules (become part of model state dict)
-    model.bbg = nn.Linear(d_model, 1)
-    nn.init.normal_(model.bbg.weight, std=1e-3); nn.init.zeros_(model.bbg.bias)
-
-    model.router = nn.Linear(d_model, n_experts)
-    nn.init.normal_(model.router.weight, std=1e-3); nn.init.zeros_(model.router.bias)
-
-    model.experts = nn.ModuleList([nn.Linear(d_model, len(braille_ids)) for _ in range(n_experts)])
-    for e in model.experts:
-        nn.init.normal_(e.weight, std=1e-3); nn.init.zeros_(e.bias)
-
-    # Hyperparameters stored on the model
-    model.register_buffer("braille_idx_tensor", torch.tensor(braille_ids, dtype=torch.long))
-    model._sp_id = int(sp_id)
-    model._bbg_alpha = float(alpha)
-    model._mbe_beta = float(beta)
-    model._router_tau = float(router_tau)
-    model._router_topk = int(router_topk)
-    model._lambda_bg = float(lambda_bg)
-    model._lambda_ent = float(lambda_ent)
-
-    # Keep original forward
-    if not hasattr(model, "_orig_forward"):
-        model._orig_forward = model.forward
-    return model
-
-import types
-from typing import Any, Dict
-
-def _forward_with_bbg_mbe(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        decoder_input_ids=None,
-        decoder_attention_mask=None,
-        labels=None,
-        inputs_embeds=None,
-        **kwargs: Dict[str, Any]
-):
-    # —— 1) generate() 编码阶段常直接传 encoder_outputs；遇到就原样回退 —— 
-    if kwargs.get("encoder_outputs", None) is not None:
-        # 不要过滤 kwargs，保持 generate() 预期
-        return self._orig_forward(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            decoder_input_ids=decoder_input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            labels=labels,
-            **kwargs
-        )
-
-    # —— 2) 二选一兜底：确保有 input_ids 或 inputs_embeds —— 
-    if inputs_embeds is None and input_ids is None:
-        raise ValueError("[BBG/MBE] Need either input_ids or inputs_embeds, got neither.")
-
-    # 如果没给 embeds，则用共享嵌入映射；后续我们在 logits 上做修改
-    if inputs_embeds is None and input_ids is not None:
-        base_embeds = self.shared(input_ids)  # T5/mT5 的共享嵌入
-        inputs_embeds = base_embeds
-        input_ids = None  # 传了 embeds 就不要再传 ids（T5 规则）
-
-    # —— 3) 先跑一遍原始 forward 拿到 logits/hidden_states —— 
-    base_out = self._orig_forward(
-        input_ids=input_ids,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        decoder_input_ids=decoder_input_ids,
-        decoder_attention_mask=decoder_attention_mask,
-        labels=labels,
-        output_hidden_states=True,   # 我们要 decoder_hidden_states
-        return_dict=True,
-        **kwargs
-    )
-
-    # —— 4) 你原有的 BBG/MBE 逻辑（保持不变） —— 
-    H = base_out.decoder_hidden_states[-1] if hasattr(base_out, 'decoder_hidden_states') else None
-    logits = base_out.logits  # [B,T,V]
-    V = logits.size(-1)
-
-    cfg = {
-        "alpha": getattr(self, "_bbg_alpha", 1.0),
-        "beta": getattr(self, "_mbe_beta", 1.0),
-        "router_tau": getattr(self, "_router_tau", 1.0),
-        "router_topk": getattr(self, "_router_topk", 0),
-        "lambda_bg": getattr(self, "_lambda_bg", 0.5),
-        "lambda_ent": getattr(self, "_lambda_ent", 0.0),
-    }
-
-    bidx = self.braille_idx_tensor.to(logits.device) if hasattr(self, 'braille_idx_tensor') else None
-    ent = H.new_tensor(0.0) if H is not None else logits.new_tensor(0.0)
-
-    gate = None
-    # ===== MBE：只覆盖盲文切片 =====
-    if bidx is not None and bidx.numel() > 0 and cfg["beta"] != 0.0 and H is not None:
-        w = self.router(H) / max(cfg["router_tau"], 1e-9)
-        pi = torch.softmax(w, dim=-1)  # [B,T,E]
-        if cfg["router_topk"] and 0 < cfg["router_topk"] < pi.size(-1):
-            topk = torch.topk(pi, cfg["router_topk"], dim=-1)
-            mask = torch.zeros_like(pi).scatter(-1, topk.indices, 1.0)
-            pi = (pi * mask) / (mask.sum(dim=-1, keepdim=True) + 1e-9)
-        ent = -(pi * (pi.clamp_min(1e-9)).log()).sum(dim=-1).mean()
-
-        exp_stack = torch.stack([e(H) for e in self.experts], dim=-1)  # [B,T,|B|,E]
-        logits_b = (exp_stack * pi.unsqueeze(-2)).sum(dim=-1)          # [B,T,|B|]
-
-        base_slice = logits.index_select(-1, bidx)                      # [B,T,|B|]
-        mixed = cfg["beta"] * logits_b + (1.0 - cfg["beta"]) * base_slice
-        logits = logits.scatter(-1, bidx.unsqueeze(0).unsqueeze(0).expand_as(mixed), mixed)
-
-    # ===== BBG：给 <sp> logit 注入偏置 =====
-    sp_id = getattr(self, "_sp_id", None)
-    if sp_id is not None and cfg["alpha"] != 0.0 and H is not None:
-        gate = torch.sigmoid(self.bbg(H)).squeeze(-1)  # [B,T]
-        logits[..., sp_id] = logits[..., sp_id] + cfg["alpha"] * gate
-
-    # ===== 在修改后的 logits 上重算损失 =====
-    loss = None
-    if labels is not None:
-        ce = F.cross_entropy(logits.view(-1, V), labels.view(-1), ignore_index=-100)
-        loss = ce
-        if gate is not None and cfg["lambda_bg"] > 0.0:
-            with torch.no_grad():
-                valid = (labels != -100).float()
-                target_sp = (labels == sp_id).float() * valid
-            bce = F.binary_cross_entropy(gate, target_sp, reduction="none")
-            loss_bg = (bce * valid).sum() / (valid.sum() + 1e-9)
-            loss = loss + cfg["lambda_bg"] * loss_bg
-        if cfg["lambda_ent"] > 0.0 and bidx is not None and bidx.numel() > 0 and cfg["beta"] != 0.0:
-            loss = loss + cfg["lambda_ent"] * (-ent)
-
-    return Seq2SeqLMOutput(
-        loss=loss,
-        logits=logits,
-        past_key_values=base_out.past_key_values,
-        decoder_hidden_states=None,
-        decoder_attentions=getattr(base_out, "decoder_attentions", None),
-        cross_attentions=getattr(base_out, "cross_attentions", None),
-        encoder_last_hidden_state=base_out.encoder_last_hidden_state,
-        encoder_hidden_states=None,
-        encoder_attentions=getattr(base_out, "encoder_attentions", None),
-    )
-
-    # Bind new forward
-    model.forward = types.MethodType(_forward_with_bbg_mbe, model)
-    return model
-
 
 # A list of all multilingual tokenizer which require src_lang and tgt_lang attributes.
 MULTILINGUAL_TOKENIZERS = [
@@ -259,10 +79,8 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
-        default="/media/ubuntu/DATA/lck/mt5_small",
         metadata={
-            "help": "LOCAL model directory path (必须包含 model.safetensors 或 pytorch_model.bin 和 config.json)"
-                    "\n示例: /media/ubuntu/DATA/lck/model"
+            "help": "Path to pretrained model or model identifier from huggingface.co/models"
         }
     )
     config_name: Optional[str] = field(
@@ -272,10 +90,9 @@ class ModelArguments:
         },
     )
     tokenizer_name: Optional[str] = field(
-        default="/media/ubuntu/DATA/lck/mt5_small",
+        default=None,
         metadata={
-            "help": "分词器目录路径（需包含 spiece.model 和 tokenizer_config.json）"
-                    "\n默认与模型目录相同"
+            "help": "Pretrained tokenizer name or path if not the same as model_name"
         },
     )
     cache_dir: Optional[str] = field(
@@ -285,10 +102,9 @@ class ModelArguments:
         },
     )
     use_fast_tokenizer: bool = field(
-        default=False,
+        default=True,
         metadata={
-            "help": "【重要】必须关闭！因使用 SentencePiece 分词器（spiece.model）"
-                    "\n开启会导致加载失败"
+            "help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."
         },
     )
     model_revision: str = field(
@@ -300,15 +116,20 @@ class ModelArguments:
     token: str = field(
         default=None,
         metadata={
-            "help": "【本地模型无需设置】仅远程私有模型需要"
-                    "\n保留为 None 即可"
-        }
+            "help": (
+                "The token to use as HTTP bearer authorization for remote files. If not specified, will use the token "
+                "generated when running `huggingface-cli login` (stored in `~/.huggingface`)."
+            )
+        },
     )
     trust_remote_code: bool = field(
         default=False,
         metadata={
-            "help": "【安全强制】必须关闭！本地模型无需远程代码执行"
-                    "\n开启可能导致安全风险"
+            "help": (
+                "Whether to trust the execution of code from datasets/models defined on the Hub."
+                " This option should only be set to `True` for repositories you trust and in which you have read the"
+                " code, as it will execute code present on the Hub on your local machine."
+            )
         },
     )
 
@@ -320,10 +141,10 @@ class DataTrainingArguments:
     """
 
     source_lang: str = field(
-        default="Chinese", metadata={"help": "Source language id for translation."}
+        default=None, metadata={"help": "Source language id for translation."}
     )
     target_lang: str = field(
-        default="Braille", metadata={"help": "Target language id for translation."}
+        default=None, metadata={"help": "Target language id for translation."}
     )
 
     dataset_name: Optional[str] = field(
@@ -337,32 +158,30 @@ class DataTrainingArguments:
         },
     )
     train_file: Optional[str] = field(
-        default="/media/ubuntu/DATA/lck/data/train.json",
-        metadata={"help": "The input training data file (a jsonlines/json)."}
+        default=None, metadata={"help": "The input training data file (a jsonlines)."}
     )
     validation_file: Optional[str] = field(
-        default="/media/ubuntu/DATA/lck/data/val.json",
+        default=None,
         metadata={
-            "help": "An optional input evaluation data file (json/jsonl)."
+            "help": "An optional input evaluation data file to evaluate the metrics (sacrebleu) on a jsonlines file."
         },
     )
     test_file: Optional[str] = field(
-        default="/media/ubuntu/DATA/lck/data/test.json",
+        default=None,
         metadata={
-            "help": "An optional input test data file (json/jsonl)."
+            "help": "An optional input test data file to evaluate the metrics (sacrebleu) on a jsonlines file."
         },
     )
-
     overwrite_cache: bool = field(
         default=False,
         metadata={"help": "Overwrite the cached training and evaluation sets"},
     )
     preprocessing_num_workers: Optional[int] = field(
-        default=os.cpu_count() // 2,
+        default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     max_source_length: Optional[int] = field(
-        default=285,
+        default=1024,
         metadata={
             "help": (
                 "The maximum total input sequence length after tokenization. Sequences longer "
@@ -371,7 +190,7 @@ class DataTrainingArguments:
         },
     )
     max_target_length: Optional[int] = field(
-        default=285,
+        default=128,
         metadata={
             "help": (
                 "The maximum total sequence length for target text after tokenization. Sequences longer "
@@ -443,7 +262,7 @@ class DataTrainingArguments:
         },
     )
     source_prefix: Optional[str] = field(
-        default="translate Chinese to Braille：",
+        default=None,
         metadata={
             "help": "A prefix to add before every source text (useful for T5 models)."
         },
@@ -461,9 +280,9 @@ class DataTrainingArguments:
 
     def __post_init__(self):
         if (
-                self.dataset_name is None
-                and self.train_file is None
-                and self.validation_file is None
+            self.dataset_name is None
+            and self.train_file is None
+            and self.validation_file is None
         ):
             raise ValueError(
                 "Need either a dataset name or a training/validation file."
@@ -478,19 +297,19 @@ class DataTrainingArguments:
         if self.train_file is not None:
             extension = self.train_file.split(".")[-1]
             assert (
-                    extension in valid_extensions
+                extension in valid_extensions
             ), "`train_file` should be a jsonlines file."
         if self.validation_file is not None:
             extension = self.validation_file.split(".")[-1]
             assert (
-                    extension in valid_extensions
+                extension in valid_extensions
             ), "`validation_file` should be a jsonlines file."
         if self.val_max_target_length is None:
             self.val_max_target_length = self.max_target_length
 
 
 def get_var_types(
-        model_args, data_args, training_args
+    model_args, data_args, training_args
 ) -> tuple[ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments]:
     return model_args, data_args, training_args
 
@@ -517,13 +336,12 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-
+    send_example_telemetry("run_translation", model_args, data_args)
 
     # Setup logging
     os.makedirs(training_args.output_dir, exist_ok=True)
     file_handler = logging.FileHandler(
-        filename=os.path.join(training_args.output_dir, "training_log.txt"),
-        encoding='utf-8'  # 添加编码参数
+        filename=os.path.join(training_args.output_dir, "training_log.txt")
     )
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
@@ -532,13 +350,7 @@ def main():
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(
-                filename=os.path.join(training_args.output_dir, "training_log.txt"),
-                encoding="utf-8"
-            )
-        ]
+        handlers=[logging.StreamHandler(sys.stdout)],
     )
 
     if training_args.should_log:
@@ -580,9 +392,9 @@ def main():
     # Detecting last checkpoint.
     last_checkpoint = None
     if (
-            os.path.isdir(training_args.output_dir)
-            and training_args.do_train
-            and not training_args.overwrite_output_dir
+        os.path.isdir(training_args.output_dir)
+        and training_args.do_train
+        and not training_args.overwrite_output_dir
     ):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
@@ -591,7 +403,7 @@ def main():
                 "Use --overwrite_output_dir to overcome."
             )
         elif (
-                last_checkpoint is not None and training_args.resume_from_checkpoint is None
+            last_checkpoint is not None and training_args.resume_from_checkpoint is None
         ):
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
@@ -679,6 +491,7 @@ def main():
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
+        token=model_args.token,
         trust_remote_code=model_args.trust_remote_code,
     )
 
@@ -688,26 +501,9 @@ def main():
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
-    
-    # === Inject BBG & MBE heads into the model (internal module changes) ===
-    try:
-        model = patch_bbg_mbe(
-            model, tokenizer,
-            n_experts=4,      # number of experts
-            router_tau=1.0,   # router temperature
-            router_topk=0,    # >0 for sparse routing
-            alpha=1.0,        # BBG strength for <sp> logit
-            beta=1.0,         # MBE replacement ratio over Braille slice
-            lambda_bg=0.5,    # BCE weight for boundary supervision
-            lambda_ent=0.0    # router entropy regularization
-        )
-        logger.info("[BBG+MBE] Successfully patched model with internal modules.")
-    except Exception as e:
-        logger.error(f"[BBG+MBE] Failed to patch model: {e}")
-        raise
-# Set decoder_start_token_id
+    # Set decoder_start_token_id
     if model.config.decoder_start_token_id is None and isinstance(
-            tokenizer, (MBartTokenizer, MBartTokenizerFast)
+        tokenizer, (MBartTokenizer, MBartTokenizerFast)
     ):
         if isinstance(tokenizer, MBartTokenizer):
             model.config.decoder_start_token_id = tokenizer.lang_code_to_id[
@@ -743,7 +539,7 @@ def main():
     # ignore those attributes).
     if isinstance(tokenizer, tuple(MULTILINGUAL_TOKENIZERS)):
         assert (
-                data_args.target_lang is not None and data_args.source_lang is not None
+            data_args.target_lang is not None and data_args.source_lang is not None
         ), (
             f"{tokenizer.__class__.__name__} is a multilingual tokenizer which requires --source_lang and "
             "--target_lang arguments."
@@ -783,35 +579,47 @@ def main():
     padding = "max_length" if data_args.pad_to_max_length else False
 
     if training_args.label_smoothing_factor > 0 and not hasattr(
-            model, "prepare_decoder_input_ids_from_labels"
+        model, "prepare_decoder_input_ids_from_labels"
     ):
         logger.warning(
-            "label_smoothing is enab256led but the `prepare_decoder_input_ids_from_labels` method is not defined for "
+            "label_smoothing is enabled but the `prepare_decoder_input_ids_from_labels` method is not defined for "
             f"`{model.__class__.__name__}`. This will lead to loss being calculated twice and will take up more memory"
         )
 
     def preprocess_function(examples):
-        pref = data_args.source_prefix or ""
-        if pref and not pref.endswith(" "):
-            pref += " "
-        inputs = [f"{pref}{x}" for x in examples["input_text"]]
+        # inputs = [ex[source_lang] for ex in examples["translation"]]
+        # targets = [ex[target_lang] for ex in examples["translation"]]
+        # inputs = [prefix + inp for inp in inputs]
+        inputs = examples["input_text"]
         targets = examples["output_text"]
-
-        # ——只打印一次，方便确认——
-        if not hasattr(preprocess_function, "_dumped"):
-            print("[PREPROCESS] prefix =", repr(pref))
-            print("[PREPROCESS] raw    =", repr(examples["input_text"][0][:80]))
-            print("[PREPROCESS] with   =", repr(inputs[0][:80]))
-            preprocess_function._dumped = True
-        # ————————————————
-
         model_inputs = tokenizer(
-            inputs, max_length=data_args.max_source_length, padding=padding, truncation=True
+            inputs,
+            max_length=data_args.max_source_length,
+            padding=padding,
+            truncation=True,
         )
+
+        # Tokenize targets with the `text_target` keyword argument
         labels = tokenizer(
-            text_target=targets, max_length=data_args.max_target_length, padding=padding, truncation=True
+            text_target=targets,
+            max_length=max_target_length,
+            padding=padding,
+            truncation=True,
         )
+
+        # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
+        # padding in the loss.
+        if padding == "max_length" and data_args.ignore_pad_token_for_loss:
+            labels["input_ids"] = [
+                [(l if l != tokenizer.pad_token_id else -100) for l in label]
+                for label in labels["input_ids"]
+            ]
+
         model_inputs["labels"] = labels["input_ids"]
+
+        # import pdb
+        # pdb.set_trace()
+
         return model_inputs
 
     if training_args.do_train:
@@ -862,7 +670,7 @@ def main():
             )
             predict_dataset = predict_dataset.select(range(max_predict_samples))
         with training_args.main_process_first(
-                desc="prediction dataset map pre-processing"
+            desc="prediction dataset map pre-processing"
         ):
             predict_dataset = predict_dataset.map(
                 preprocess_function,
@@ -888,8 +696,7 @@ def main():
         )
 
     # Metric
-    metric = evaluate.load("/media/ubuntu/DATA/lck/metrics/sacrebleu")
-
+    metric = evaluate.load("sacrebleu")
 
     def postprocess_text(preds, labels):
         preds = [pred.strip() for pred in preds]
@@ -953,9 +760,8 @@ def main():
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        tokenizer.save_pretrained(training_args.output_dir)
+        print("train_result:", train_result)
         trainer.save_model()  # Saves the tokenizer too for easy upload
-
 
         metrics = train_result.metrics
         max_train_samples = (
