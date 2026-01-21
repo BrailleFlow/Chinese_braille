@@ -23,7 +23,6 @@ accelerate launch run_translation.py \
   --val_max_target_length 300 \
   --use_fast_tokenizer False \
   --preprocessing_num_workers 4 \
-  --overwrite_cache True \
   --warmup_ratio 0.01 \
   --fp16 False \
   --save_steps 10000 \
