@@ -47,7 +47,6 @@ bash evaluation.sh
 
 ## Reproducibility and Resource Release Plan
 
-We highly value experimental reproducibility and transparency, and we appreciate the community’s interest in verifying and extending this work.
 
 ### Data availability
 
