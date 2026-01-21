@@ -40,6 +40,7 @@ bash evaluation.sh
 
 ### Model Architecture
 
-![Model Architecture](./image/Model%20Architecture%20Diagram.png)
+**Fig. 1. Model Architecture.**
 
+![Fig. 1 – Model Architecture](./fig1.jpg)
 
