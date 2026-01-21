@@ -44,3 +44,30 @@ bash evaluation.sh
 
 ![Fig. 1 – Model Architecture](./fig1.jpg)
 
+
+## Reproducibility and Resource Release Plan
+
+We highly value experimental reproducibility and transparency, and we appreciate the community’s interest in verifying and extending this work.
+
+### Data availability
+
+The Chinese–Braille parallel corpus used in this study was jointly constructed with a collaborating Braille school based on real teaching and learning scenarios. The dataset contains school-specific instructional materials as well as learning and usage records of visually impaired students.  
+Due to collaboration agreements and privacy protection requirements, the full dataset cannot be publicly released at this time.
+
+### Planned public resources
+
+To lower the barrier for experimental replication and to support reproducibility despite the above constraints, we are preparing the following resources for public release:
+
+- Trained model checkpoints corresponding to the main experiments and ablation studies reported in the paper.
+- Detailed configuration files specifying all training and evaluation hyperparameters.
+- Executable scripts and step-by-step instructions for running training and evaluation under the same model architectures and settings.
+
+These resources are currently being prepared and will be made publicly available in this repository in the near future.
+
+The planned directory structure is as follows:
+
+```text
+checkpoints/   # trained model checkpoints (to be released)
+configs/       # experiment configuration files
+splits/        # data split identifiers (hashed, no raw text)
+
