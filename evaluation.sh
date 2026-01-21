@@ -14,7 +14,6 @@ accelerate launch run_translation.py \
   --per_device_eval_batch_size 16 \
   --overwrite_output_dir True \
   --seed 42 \
-  --logging_steps 10 \
   --max_source_length 128 \
   --max_target_length 300 \
   --val_max_target_length 300 \
