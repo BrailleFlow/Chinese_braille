@@ -52,7 +52,7 @@ We highly value experimental reproducibility and transparency, and we appreciate
 ### Data availability
 
 The Chinese–Braille parallel corpus used in this study was jointly constructed with a collaborating Braille school based on real teaching and learning scenarios. The dataset contains school-specific instructional materials as well as learning and usage records of visually impaired students.  
-Due to collaboration agreements and privacy protection requirements, the full dataset cannot be publicly released at this time.
+Due to collaboration agreements and privacy protection requirements, the full dataset cannot be publicly released at this time. We are currently in communication with the data providers and will explore feasible ways to make relevant parts of the dataset publicly available in the future, subject to appropriate compliance and privacy constraints.
 
 ### Planned public resources
 
