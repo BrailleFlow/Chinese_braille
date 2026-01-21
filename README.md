@@ -67,5 +67,5 @@ The planned directory structure is as follows:
 
 ```text
 checkpoints/   # trained model checkpoints (to be released)
-......
+...
 
